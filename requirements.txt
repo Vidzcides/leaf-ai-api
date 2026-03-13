@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+numpy
+opencv-python-headless
+pillow
+tqdm
+torch
+torchvision
+segment_anything @ git+https://github.com/facebookresearch/segment-anything.git
