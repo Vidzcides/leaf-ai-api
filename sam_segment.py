@@ -24,14 +24,13 @@ sam.to(device=DEVICE)
 # Lower-memory SAM settings for Railway
 mask_generator = SamAutomaticMaskGenerator(
     model=sam,
-    points_per_side=16,
-    points_per_batch=32,
+    points_per_side=8,
+    points_per_batch=16,
     pred_iou_thresh=0.88,
     stability_score_thresh=0.92,
     crop_n_layers=0,
     min_mask_region_area=500,
 )
-
 IMAGE_SIZE = (320, 320)
 MIN_CONTOUR_AREA = 5000
 MAX_LEAVES = 1  # Only take largest leaf
