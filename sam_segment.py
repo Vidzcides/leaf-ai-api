@@ -1,3 +1,5 @@
+import os
+import urllib.request
 import cv2
 import numpy as np
 import torch
@@ -5,8 +7,15 @@ from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
 SAM_CHECKPOINT = "sam_vit_b_01ec64.pth"
 SAM_MODEL_TYPE = "vit_b"
+SAM_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
 
 DEVICE = "cpu"
+
+# Download SAM model automatically if missing
+if not os.path.exists(SAM_CHECKPOINT):
+    print("Downloading SAM ViT-B model...")
+    urllib.request.urlretrieve(SAM_URL, SAM_CHECKPOINT)
+    print("SAM ViT-B downloaded.")
 
 # Load SAM model
 sam = sam_model_registry[SAM_MODEL_TYPE](checkpoint=SAM_CHECKPOINT)
@@ -70,7 +79,9 @@ def extract_leaf(image):
         rotated_mask = cv2.morphologyEx(rotated_mask, cv2.MORPH_OPEN, kernel)
 
         # Keep largest connected component
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(rotated_mask, connectivity=8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            rotated_mask, connectivity=8
+        )
         if num_labels <= 1:
             continue
         largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
