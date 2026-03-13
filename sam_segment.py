@@ -3,15 +3,17 @@ import urllib.request
 import cv2
 import numpy as np
 import torch
-from segment_anything import sam_model_registry, SamPredictor
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
 SAM_CHECKPOINT = "sam_vit_b_01ec64.pth"
 SAM_MODEL_TYPE = "vit_b"
 SAM_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
 
-DEVICE = "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 IMAGE_SIZE = (320, 320)
 MIN_CONTOUR_AREA = 5000
+MAX_LEAVES = 1  # keep largest leaf only
 
 # Download SAM model automatically if missing
 if not os.path.exists(SAM_CHECKPOINT):
@@ -22,50 +24,15 @@ if not os.path.exists(SAM_CHECKPOINT):
 # Load SAM model
 sam = sam_model_registry[SAM_MODEL_TYPE](checkpoint=SAM_CHECKPOINT)
 sam.to(device=DEVICE)
-predictor = SamPredictor(sam)
 
-
-def get_leaf_prompt_point(image_bgr):
-    """
-    Try to find the main green leaf-like region and return its center point.
-    Fallback: image center.
-    """
-    img = image_bgr.copy()
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-    # Broad green range
-    lower_green = np.array([25, 20, 20], dtype=np.uint8)
-    upper_green = np.array([95, 255, 255], dtype=np.uint8)
-    mask = cv2.inRange(hsv, lower_green, upper_green)
-
-    # Clean mask
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    h, w = image_bgr.shape[:2]
-
-    if contours:
-        c = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(c)
-
-        if area >= MIN_CONTOUR_AREA:
-            M = cv2.moments(c)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                return cx, cy
-
-    # fallback: center of image
-    return w // 2, h // 2
+# Full SAM automatic mask generation (better quality, heavier)
+mask_generator = SamAutomaticMaskGenerator(sam)
 
 
 def extract_leaf(image):
-    # Resize large images before SAM to reduce memory usage
+    # Use larger image size now that Colab has enough memory
     h, w = image.shape[:2]
-    max_dim = 512
+    max_dim = 1024
 
     if max(h, w) > max_dim:
         scale = max_dim / max(h, w)
@@ -75,117 +42,145 @@ def extract_leaf(image):
 
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    # Automatically find prompt point
-    cx, cy = get_leaf_prompt_point(image)
-    print(f"SAM prompt point: ({cx}, {cy})")
-
-    predictor.set_image(image_rgb)
-
-    input_point = np.array([[cx, cy]])
-    input_label = np.array([1])  # foreground point
-
-    masks, scores, _ = predictor.predict(
-        point_coords=input_point,
-        point_labels=input_label,
-        multimask_output=True
-    )
-
+    # Generate masks
+    masks = mask_generator.generate(image_rgb)
     print("SAM masks generated:", len(masks))
 
-    if masks is None or len(masks) == 0:
+    if not masks:
+        print("FALLBACK: no masks found")
         return cv2.resize(image, IMAGE_SIZE)
 
-    # Pick best-scoring mask
-    best_idx = int(np.argmax(scores))
-    leaf_mask = masks[best_idx].astype(np.uint8)
+    # Take largest masks
+    masks = sorted(masks, key=lambda m: m["segmentation"].sum(), reverse=True)[:MAX_LEAVES]
 
-    if leaf_mask.sum() < MIN_CONTOUR_AREA:
-        return cv2.resize(image, IMAGE_SIZE)
+    for mask in masks:
+        leaf_mask = np.ascontiguousarray(mask["segmentation"].astype(np.uint8))
 
-    # Keep largest contour
-    contours, _ = cv2.findContours(leaf_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return cv2.resize(image, IMAGE_SIZE)
+        if leaf_mask.sum() < MIN_CONTOUR_AREA:
+            print("FALLBACK: mask too small")
+            continue
 
-    c = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(c) < MIN_CONTOUR_AREA:
-        return cv2.resize(image, IMAGE_SIZE)
+        # Keep largest contour
+        contours, _ = cv2.findContours(
+            leaf_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
 
-    clean_mask = np.zeros_like(leaf_mask, dtype=np.uint8)
-    cv2.drawContours(clean_mask, [c], -1, 1, thickness=-1)
+        if not contours:
+            print("FALLBACK: no contours")
+            continue
 
-    # Rotate leaf upright
-    rect = cv2.minAreaRect(c)
-    angle = rect[2]
-    if rect[1][0] < rect[1][1]:
-        angle += 90
+        c = max(contours, key=cv2.contourArea)
 
-    h_mask, w_mask = clean_mask.shape
-    center = (w_mask // 2, h_mask // 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        if cv2.contourArea(c) < MIN_CONTOUR_AREA:
+            print("FALLBACK: contour too small")
+            continue
 
-    rotated_image = cv2.warpAffine(
-        image_rgb,
-        M,
-        (w_mask, h_mask),
-        flags=cv2.INTER_CUBIC,
-        borderValue=(0, 0, 0)
-    )
+        clean_mask = np.zeros_like(leaf_mask, dtype=np.uint8)
+        cv2.drawContours(clean_mask, [c], -1, 1, thickness=-1)
 
-    rotated_mask = cv2.warpAffine(
-        clean_mask,
-        M,
-        (w_mask, h_mask),
-        flags=cv2.INTER_NEAREST,
-        borderValue=0
-    )
-    rotated_mask = (rotated_mask > 0).astype(np.uint8)
+        # Rotate leaf upright
+        rect = cv2.minAreaRect(c)
+        angle = rect[2]
 
-    # Morph cleanup
-    kernel = np.ones((3, 3), np.uint8)
-    rotated_mask = cv2.morphologyEx(rotated_mask, cv2.MORPH_OPEN, kernel)
+        if rect[1][0] < rect[1][1]:
+            angle += 90
 
-    # Keep largest connected component
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(rotated_mask, connectivity=8)
-    if num_labels <= 1:
-        return cv2.resize(image, IMAGE_SIZE)
+        h_mask, w_mask = clean_mask.shape
+        center = (w_mask // 2, h_mask // 2)
 
-    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-    rotated_mask = (labels == largest_label).astype(np.uint8)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
 
-    if rotated_mask.sum() < MIN_CONTOUR_AREA:
-        return cv2.resize(image, IMAGE_SIZE)
+        rotated_image = cv2.warpAffine(
+            image_rgb,
+            M,
+            (w_mask, h_mask),
+            flags=cv2.INTER_CUBIC,
+            borderValue=(0, 0, 0)
+        )
 
-    # Tight crop
-    contours, _ = cv2.findContours(rotated_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return cv2.resize(image, IMAGE_SIZE)
+        rotated_mask = cv2.warpAffine(
+            clean_mask,
+            M,
+            (w_mask, h_mask),
+            flags=cv2.INTER_NEAREST,
+            borderValue=0
+        )
 
-    c = max(contours, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(c)
+        rotated_mask = (rotated_mask > 0).astype(np.uint8)
 
-    cropped_leaf = rotated_image[y:y + h, x:x + w]
-    cropped_mask = rotated_mask[y:y + h, x:x + w]
+        # Morph cleanup
+        kernel = np.ones((3, 3), np.uint8)
+        rotated_mask = cv2.morphologyEx(
+            rotated_mask,
+            cv2.MORPH_OPEN,
+            kernel
+        )
 
-    # Black background
-    black_bg = np.zeros_like(cropped_leaf)
-    black_bg[cropped_mask != 0] = cropped_leaf[cropped_mask != 0]
+        # Keep largest connected component
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            rotated_mask,
+            connectivity=8
+        )
 
-    # Resize + pad to IMAGE_SIZE
-    h_crop, w_crop = black_bg.shape[:2]
-    scale = min(IMAGE_SIZE[0] / h_crop, IMAGE_SIZE[1] / w_crop)
-    new_w = int(w_crop * scale)
-    new_h = int(h_crop * scale)
+        if num_labels <= 1:
+            print("FALLBACK: no connected components")
+            continue
 
-    resized_leaf = cv2.resize(
-        black_bg,
-        (new_w, new_h),
-        interpolation=cv2.INTER_LANCZOS4
-    )
+        largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        rotated_mask = (labels == largest_label).astype(np.uint8)
 
-    final_leaf = np.zeros((IMAGE_SIZE[0], IMAGE_SIZE[1], 3), dtype=np.uint8)
-    x_offset = (IMAGE_SIZE[1] - new_w) // 2
-    y_offset = (IMAGE_SIZE[0] - new_h) // 2
-    final_leaf[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized_leaf
+        if rotated_mask.sum() < MIN_CONTOUR_AREA:
+            print("FALLBACK: rotated mask too small")
+            continue
 
-    return cv2.cvtColor(final_leaf, cv2.COLOR_RGB2BGR)
+        # Tight crop
+        contours, _ = cv2.findContours(
+            rotated_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        if not contours:
+            print("FALLBACK: no contours after rotation")
+            continue
+
+        c = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(c)
+
+        cropped_leaf = rotated_image[y:y + h, x:x + w]
+        cropped_mask = rotated_mask[y:y + h, x:x + w]
+
+        # Black background
+        black_bg = np.zeros_like(cropped_leaf)
+        black_bg[cropped_mask != 0] = cropped_leaf[cropped_mask != 0]
+
+        # Resize + pad to target size
+        h_crop, w_crop = black_bg.shape[:2]
+        scale = min(IMAGE_SIZE[0] / h_crop, IMAGE_SIZE[1] / w_crop)
+
+        new_w = int(w_crop * scale)
+        new_h = int(h_crop * scale)
+
+        resized_leaf = cv2.resize(
+            black_bg,
+            (new_w, new_h),
+            interpolation=cv2.INTER_LANCZOS4
+        )
+
+        final_leaf = np.zeros((IMAGE_SIZE[0], IMAGE_SIZE[1], 3), dtype=np.uint8)
+
+        x_offset = (IMAGE_SIZE[1] - new_w) // 2
+        y_offset = (IMAGE_SIZE[0] - new_h) // 2
+
+        final_leaf[
+            y_offset:y_offset + new_h,
+            x_offset:x_offset + new_w
+        ] = resized_leaf
+
+        print("SUCCESS: segmented leaf returned")
+        return cv2.cvtColor(final_leaf, cv2.COLOR_RGB2BGR)
+
+    print("FALLBACK: returning resized original")
+    return cv2.resize(image, IMAGE_SIZE)
